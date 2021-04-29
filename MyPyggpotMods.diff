@@ -1,0 +1,122 @@
+diff --git a/internal/providers/coin/provider.go b/internal/providers/coin/provider.go
+index ebe9cf9..76ca506 100644
+--- a/internal/providers/coin/provider.go
++++ b/internal/providers/coin/provider.go
+@@ -4,12 +4,13 @@ import (
+ 	"context"
+ 	"database/sql"
+ 	"fmt"
++
+ 	"github.com/aspiration-labs/pyggpot/internal/models"
+-	"github.com/aspiration-labs/pyggpot/rpc/go/coin"
++	coin_service "github.com/aspiration-labs/pyggpot/rpc/go/coin"
+ 	"github.com/twitchtv/twirp"
+ )
+ 
+-type coinServer struct{
++type coinServer struct {
+ 	DB *sql.DB
+ }
+ 
+@@ -31,9 +32,9 @@ func (s *coinServer) AddCoins(ctx context.Context, request *coin_service.AddCoin
+ 	for _, coin := range request.Coins {
+ 		fmt.Println(coin)
+ 		newCoin := models.Coin{
+-			PotID: request.PotId,
++			PotID:        request.PotId,
+ 			Denomination: int32(coin.Kind),
+-			CoinCount: coin.Count,
++			CoinCount:    coin.Count,
+ 		}
+ 		err = newCoin.Save(tx)
+ 		if err != nil {
+@@ -50,6 +51,74 @@ func (s *coinServer) AddCoins(ctx context.Context, request *coin_service.AddCoin
+ 	}, nil
+ }
+ 
+-func (s *coinServer) RemoveCoins(context.Context, *coin_service.RemoveCoinsRequest) (*coin_service.CoinsListResponse, error) {
+-	panic("implement me")
++func (s *coinServer) RemoveCoins(ctx context.Context, req *coin_service.RemoveCoinsRequest) (*coin_service.CoinsListResponse, error) {
++	tx, err := s.DB.Begin()
++	if err != nil {
++		return nil, twirp.InternalError(err.Error())
++	}
++
++	var coinList = make(map[coin_service.Coins_Kind]coin_service.Coins)
++
++	_, err = models.PotByID(s.DB, req.GetPotId())
++	if err != nil {
++		return nil, err
++	}
++	coins, err := models.CoinsInPotsByPot_id(s.DB, int(req.GetPotId()))
++	if err != nil {
++		return nil, err
++	}
++	if int(req.GetCount()) > len(coins) {
++		return nil, twirp.InternalError("pot count exceeds max coins")
++	}
++
++	count := req.Count
++	for count > 0 && len(coins) > 0 {
++		for i, _ := range coins {
++			cn := *coins[i]
++			if cn.CoinCount > 0 {
++				cn.CoinCount = cn.CoinCount - 1
++				cnModel, err := models.CoinByID(tx, cn.ID)
++				if err != nil {
++					tx.Rollback()
++					return nil, err
++				}
++				cnModel.CoinCount = cn.CoinCount
++				err = cnModel.Update(tx)
++				if err != nil {
++					tx.Rollback()
++					return nil, err
++				}
++
++				cns := coinList[coin_service.Coins_Kind(cn.Denomination)]
++				cns.Count = cns.Count + 1
++				coinList[coin_service.Coins_Kind(cn.Denomination)] = cns
++
++				count = count - 1
++				if count == 0 {
++					break
++				}
++			} else {
++				if len(coins) > 0 {
++					coins = append(coins[:i], coins[i+1:]...)
++				} else {
++					break
++				}
++			}
++		}
++	}
++	err = tx.Commit()
++	if err != nil {
++		return nil, err
++	}
++	var resp coin_service.CoinsListResponse
++	var respList []*coin_service.Coins
++	for den, v := range coinList {
++		c := coin_service.Coins{
++			Kind:  den,
++			Count: v.Count,
++		}
++		respList = append(respList, &c)
++	}
++	resp.Coins = respList
++	return &resp, nil
+ }
+diff --git a/proto/pot/service.proto b/proto/pot/service.proto
+index ce31dfa..0c61deb 100644
+--- a/proto/pot/service.proto
++++ b/proto/pot/service.proto
+@@ -36,7 +36,7 @@ message CreatePotRequest {
+     string pot_name = 1 [
+         (validator.field) = {
+             regex: "^[A-Za-z0-9]{2}(?:[ _-]?[A-Za-z0-9])+$"
+-            human_error: "Can contain only alphanumeric characters, dot and underscore."
++            human_error: "Can contain only alphanumeric characters, dot,hyphen and underscore and length should be greater than 2."
+         }
+     ]; // required
+     int32 max_coins = 2 [(validator.field) = {int_gt:5}];
